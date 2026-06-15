@@ -108,7 +108,7 @@ def build_features(merged: pd.DataFrame) -> np.ndarray:
     vol_eth   = merged["volume_eth"].values.astype(np.float64)
     trades    = merged["trades_count_btc"].values.astype(np.float64)
     T = len(merged)
-    X = np.zeros((T, 8), dtype=np.float32)
+    X = np.zeros((T, 10), dtype=np.float32)   # 10피처 (Volat_eth, BB_Width_eth 포함)
 
     for i in range(1, T):
         ret_btc    = math.log(close_btc[i] / close_btc[i-1] + LOG_EPS)
@@ -117,16 +117,26 @@ def build_features(merged: pd.DataFrame) -> np.ndarray:
         log_trades = math.log(trades[i] + LOG_EPS)
 
         s  = max(1, i - VOLAT_WINDOW + 1)
-        rr = [math.log(close_btc[j]/close_btc[j-1]+LOG_EPS) for j in range(s, i+1)]
-        volat = float(np.std(rr)) if len(rr) > 1 else 0.0
+        # BTC 변동성
+        rr_btc    = [math.log(close_btc[j]/close_btc[j-1]+LOG_EPS) for j in range(s, i+1)]
+        volat_btc = float(np.std(rr_btc)) if len(rr_btc) > 1 else 0.0
+        # ETH 변동성 ★
+        rr_eth    = [math.log(close_eth[j]/close_eth[j-1]+LOG_EPS) for j in range(s, i+1)]
+        volat_eth = float(np.std(rr_eth)) if len(rr_eth) > 1 else 0.0
 
-        bbs  = max(0, i - BB_PERIOD + 1)
-        cw   = close_btc[bbs:i+1]
-        sma  = cw.mean()
-        bbw  = (4.0 * cw.std() / sma) if sma > 0 else 0.0
+        bbs = max(0, i - BB_PERIOD + 1)
+        # BTC BB_Width
+        cw_btc  = close_btc[bbs:i+1]
+        sma_btc = cw_btc.mean()
+        bbw_btc = (4.0 * cw_btc.std() / sma_btc) if sma_btc > 0 else 0.0
+        # ETH BB_Width ★
+        cw_eth  = close_eth[bbs:i+1]
+        sma_eth = cw_eth.mean()
+        bbw_eth = (4.0 * cw_eth.std() / sma_eth) if sma_eth > 0 else 0.0
 
-        X[i] = [ret_btc, ret_eth, log_pow, log_trades, volat, bbw,
-                vol_btc[i], vol_eth[i]]
+        X[i] = [ret_btc, ret_eth, log_pow, log_trades,
+                volat_btc, bbw_btc, vol_btc[i], vol_eth[i],
+                volat_eth, bbw_eth]   # ★ 10피처
 
     return np.nan_to_num(X[1:], nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -244,6 +254,18 @@ for model_name in TARGETS:
         joblib.dump(scl, "models/scaler.pkl")
         print(f"  scaler: models/scaler.pkl  (봇 런타임용, trade 기준)")
         scaler_saved = True
+
+    # 타깃 정규화 scale 저장 — 02_train_model.py 에서 로드해 loss 계산에 사용
+    # ETH 가중 손실 구현을 위해 각 심볼 std 를 별도 저장
+    y_scale = {
+        "btc_std": float(y_btc[:te].std()),
+        "eth_std": float(y_eth[:te].std()),
+    }
+    import json
+    scale_path = f"models/y_scale_{model_name}.json"
+    with open(scale_path, "w") as fp:
+        json.dump(y_scale, fp)
+    print(f"  y_scale: {scale_path}  (btc_std={y_scale['btc_std']:.5f}, eth_std={y_scale['eth_std']:.5f})")
 
     # 저장
     out_dir = Path(f"data/{model_name}")
