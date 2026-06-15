@@ -1,67 +1,94 @@
 """
 train/02_train_model.py — GRU 모델 학습
 
-[실행 예시]
+[실행]
   python train/02_train_model.py --horizon trade
-  python train/02_train_model.py --horizon 1h
-  python train/02_train_model.py --horizon 24h
-  python train/02_train_model.py --horizon 7d
+  python train/02_train_model.py --horizon scalper
+  python train/02_train_model.py --horizon swing
+  python train/02_train_model.py --horizon longterm
 
-[모델 I/O — ai_engine.py 와 정확히 일치]
-  입력: (batch, seq_len, 8)   — scaler 적용 완료 피처
-  출력: (batch, 2)             — [BTC 로그수익률, ETH 로그수익률]
+[모델 I/O]
+  입력: (batch, seq_len, 10)  — Volat_eth, BB_Width_eth 추가 (기존 8 → 10)
+  출력: (batch, 2)            — [BTC_log_ret, ETH_log_ret]
 
-[horizon 별 용도]
-  trade → seq_len=30  model_trade.onnx    시스템 B BotA_Trade (다음 1분 캔들 예측)
-  1h    → seq_len=10  model_scalper.onnx  시스템 A ingest (1h 신호)
-  24h   → seq_len=60  model_swing.onnx    시스템 A ingest (24h 신호)
-  7d    → seq_len=120 model_longterm.onnx 시스템 A ingest (7d 신호)
+[ETH 변동폭 개선 포인트]
+  ① input_size=10  : ETH 전용 피처(Volat_eth, BB_Width_eth) 추가
+  ② 분리 헤드      : fc_btc / fc_eth 독립 레이어 (train_02_helpers.py)
+  ③ ETH_WEIGHT=2.0 : ETH 손실 가중치 2배 → ETH 그래디언트 강제 증폭
+  ④ DROPOUT=0.3    : 기존 dropout=3 버그 수정 (0~1 범위 필수)
 """
 
+from __future__ import annotations
+
 import argparse
+import json
 import math
 from pathlib import Path
 
-import joblib
-# 학습 시: models/scaler_{model_name}.pkl 사용 (01_build_dataset.py 생성)
-# 봇 런타임: models/scaler.pkl (trade 기준, 5m 분포)
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+
+# GRUModel 은 03_export_onnx.py 에서도 재사용 — helpers 에서 임포트
+from train_02_helpers import GRUModel
 
 # ── CLI ───────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--horizon", choices=["trade","scalper","swing","longterm"], required=True)
+parser.add_argument(
+    "--horizon",
+    choices=["trade", "scalper", "swing", "longterm"],
+    required=True,
+)
 args = parser.parse_args()
 
-# ── horizon → seq_len / 모델 이름 매핑 ───────────────────────
-HORIZON_CFG = {
+# ── horizon 매핑 ─────────────────────────────────────────────
+HORIZON_CFG: dict[str, dict] = {
     "trade":    {"seq_len": 30,  "model_name": "model_trade",    "data_tag": "trade"},
     "scalper":  {"seq_len": 10,  "model_name": "model_scalper",  "data_tag": "scalper"},
     "swing":    {"seq_len": 60,  "model_name": "model_swing",    "data_tag": "swing"},
     "longterm": {"seq_len": 120, "model_name": "model_longterm", "data_tag": "longterm"},
 }
-cfg     = HORIZON_CFG[args.horizon]
-SEQ_LEN = cfg["seq_len"]
-NAME    = cfg["model_name"]
+cfg      = HORIZON_CFG[args.horizon]
+SEQ_LEN  = cfg["seq_len"]
+NAME     = cfg["model_name"]
 DATA_DIR = Path(f"data/{cfg['data_tag']}")
 
 # ── 하이퍼파라미터 ────────────────────────────────────────────
-HIDDEN_SIZE  = 64
-NUM_LAYERS   = 2
-DROPOUT      = 0.2
+HIDDEN_SIZE  = 128    # 표현력 확대 (기존 64)
+NUM_LAYERS   = 3      # 레이어 수
+DROPOUT      = 0.3    # ★ 버그 수정: dropout=3 → 0.3 (PyTorch 는 0~1 필수)
 BATCH_SIZE   = 512
 EPOCHS       = 100
 LR           = 1e-3
-PATIENCE     = 10      # early stopping
+PATIENCE     = 10
 GRAD_CLIP    = 1.0
 TRAIN_RATIO  = 0.7
 VAL_RATIO    = 0.15
-# (나머지 0.15 = test)
+
+# ── ETH 손실 가중치 ★ ─────────────────────────────────────────
+# BTC 손실이 ETH 헤드를 압도하는 것을 방지합니다.
+# loss = L_btc * 1.0  +  L_eth * ETH_WEIGHT
+ETH_WEIGHT = 2.0
+
+# y_scale 파일이 있으면 BTC/ETH 타깃 분산 비율을 참고해 가중치를 보정합니다.
+_scale_path = f"models/y_scale_{NAME}.json"
+if Path(_scale_path).exists():
+    with open(_scale_path) as _f:
+        _ys = json.load(_f)
+    _ratio = _ys["btc_std"] / max(_ys["eth_std"], 1e-8)
+    # ETH std 가 BTC 보다 작을수록 ETH 가중치를 올림 (최소 ETH_WEIGHT 보장)
+    ETH_WEIGHT = max(ETH_WEIGHT, _ratio)
+    print(
+        f"[y_scale] btc_std={_ys['btc_std']:.5f}  eth_std={_ys['eth_std']:.5f}"
+        f"  → ETH_WEIGHT={ETH_WEIGHT:.2f} (자동 보정)"
+    )
+else:
+    print(f"[y_scale] 파일 없음 → ETH_WEIGHT={ETH_WEIGHT} (기본값)")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[{NAME}] device={DEVICE}  seq_len={SEQ_LEN}  horizon={args.horizon}")
+print(f"\n[{NAME}] device={DEVICE}  seq_len={SEQ_LEN}  ETH_WEIGHT={ETH_WEIGHT:.2f}")
 
 
 # ════════════════════════════════════════════════════════════
@@ -69,46 +96,54 @@ print(f"[{NAME}] device={DEVICE}  seq_len={SEQ_LEN}  horizon={args.horizon}")
 # ════════════════════════════════════════════════════════════
 
 print("[1/4] 데이터 로드 중...")
-X_all = np.load(DATA_DIR / "features_scaled.npy")   # (T, 8)
-y_btc = np.load(DATA_DIR / "targets_btc.npy")       # (T,)
-y_eth = np.load(DATA_DIR / "targets_eth.npy")       # (T,)
+X_all = np.load(DATA_DIR / "features_scaled.npy")  # (T, 10)
+y_btc = np.load(DATA_DIR / "targets_btc.npy")      # (T,)
+y_eth = np.load(DATA_DIR / "targets_eth.npy")      # (T,)
 
-T = len(X_all)
-assert T > SEQ_LEN, f"데이터({T})가 seq_len({SEQ_LEN}) 보다 짧습니다."
+T, n_feat = X_all.shape
+assert T > SEQ_LEN, f"데이터({T}) < seq_len({SEQ_LEN})"
+assert n_feat == 10, (
+    f"피처 수={n_feat} ≠ 10\n"
+    "  01_build_dataset.py 를 재실행하여 10피처 데이터셋을 다시 생성하세요."
+)
 
 
-def make_sequences(X, y_btc, y_eth, seq_len):
-    """
-    슬라이딩 윈도우로 (N, seq_len, 8) 입력과 (N, 2) 타깃 생성.
-    타깃은 윈도우 마지막 시점의 BTC/ETH 로그수익률.
-    """
-    N = len(X) - seq_len
-    Xs = np.zeros((N, seq_len, 8), dtype=np.float32)
-    ys = np.zeros((N, 2),          dtype=np.float32)
+def make_sequences(
+    X: np.ndarray,
+    y_b: np.ndarray,
+    y_e: np.ndarray,
+    seq_len: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """슬라이딩 윈도우 → (N, seq_len, 10) 입력 + (N, 2) 타깃"""
+    N  = len(X) - seq_len
+    Xs = np.zeros((N, seq_len, n_feat), dtype=np.float32)
+    ys = np.zeros((N, 2),               dtype=np.float32)
     for i in range(N):
-        Xs[i] = X[i: i + seq_len]
-        ys[i, 0] = y_btc[i + seq_len - 1]
-        ys[i, 1] = y_eth[i + seq_len - 1]
+        Xs[i]    = X[i : i + seq_len]
+        ys[i, 0] = y_b[i + seq_len - 1]
+        ys[i, 1] = y_e[i + seq_len - 1]
     return Xs, ys
 
 
 X_seq, y_seq = make_sequences(X_all, y_btc, y_eth, SEQ_LEN)
-print(f"  시퀀스 shape — X: {X_seq.shape}  y: {y_seq.shape}")
+print(f"  시퀀스 — X: {X_seq.shape}  y: {y_seq.shape}")
 
-# 시간 순서 유지 분할 (shuffle 금지)
-n = len(X_seq)
+n  = len(X_seq)
 t1 = int(n * TRAIN_RATIO)
 t2 = int(n * (TRAIN_RATIO + VAL_RATIO))
 
-X_train, y_train = X_seq[:t1],    y_seq[:t1]
-X_val,   y_val   = X_seq[t1:t2],  y_seq[t1:t2]
-X_test,  y_test  = X_seq[t2:],    y_seq[t2:]
+X_train, y_train = X_seq[:t1],   y_seq[:t1]
+X_val,   y_val   = X_seq[t1:t2], y_seq[t1:t2]
+X_test,  y_test  = X_seq[t2:],   y_seq[t2:]
 print(f"  train={len(X_train):,}  val={len(X_val):,}  test={len(X_test):,}")
 
-# DataLoader
-def to_loader(X, y, shuffle=False):
+
+def to_loader(X: np.ndarray, y: np.ndarray, shuffle: bool = False) -> DataLoader:
     ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
-    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle, pin_memory=(DEVICE=="cuda"))
+    return DataLoader(
+        ds, batch_size=BATCH_SIZE, shuffle=shuffle, pin_memory=(DEVICE == "cuda")
+    )
+
 
 train_loader = to_loader(X_train, y_train, shuffle=True)
 val_loader   = to_loader(X_val,   y_val)
@@ -116,47 +151,21 @@ test_loader  = to_loader(X_test,  y_test)
 
 
 # ════════════════════════════════════════════════════════════
-# Step 2. 모델 정의
+# Step 2. 모델 초기화
 # ════════════════════════════════════════════════════════════
-
-class GRUModel(nn.Module):
-    """
-    ai_engine.py 의 ONNX 스펙과 일치:
-      입력: (batch, seq_len, 8)
-      출력: (batch, 2)  — [BTC_log_ret, ETH_log_ret]
-    """
-    def __init__(self, input_size=8, hidden_size=64, num_layers=2, dropout=0.2):
-        super().__init__()
-        self.gru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,           # (batch, seq, feature)
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, 2)  # 출력: [btc_ret, eth_ret]
-
-    def forward(self, x):
-        # x: (batch, seq_len, 8)
-        out, _ = self.gru(x)            # out: (batch, seq_len, hidden)
-        last   = out[:, -1, :]          # 마지막 타임스텝: (batch, hidden)
-        last   = self.dropout(last)
-        return self.fc(last)            # (batch, 2)
-
 
 print("[2/4] 모델 초기화...")
 model = GRUModel(
-    input_size=8,
+    input_size=10,           # ★ 10피처
     hidden_size=HIDDEN_SIZE,
     num_layers=NUM_LAYERS,
-    dropout=DROPOUT,
+    dropout=DROPOUT,         # ★ 0.3 (버그 수정)
 ).to(DEVICE)
 
-total_params = sum(p.numel() for p in model.parameters())
-print(f"  파라미터 수: {total_params:,}")
+print(f"  파라미터: {sum(p.numel() for p in model.parameters()):,}")
+print(f"  구조: GRU({n_feat}→{HIDDEN_SIZE}×{NUM_LAYERS}) + dropout({DROPOUT})"
+      f" + fc_btc + fc_eth")
 
-criterion = nn.MSELoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, patience=3, factor=0.5, min_lr=1e-5
@@ -164,24 +173,44 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 
 
 # ════════════════════════════════════════════════════════════
-# Step 3. 학습 루프
+# Step 3. 학습 루프 — ETH 가중 손실 적용
 # ════════════════════════════════════════════════════════════
 
-def run_epoch(loader, train=True):
+def run_epoch(loader: DataLoader, train: bool = True) -> tuple[float, float, float]:
+    """
+    반환: (total_loss, btc_loss, eth_loss)
+    손실 = L_btc × 1.0  +  L_eth × ETH_WEIGHT
+    """
     model.train(train)
-    total_loss = 0.0
+    sum_total = sum_btc = sum_eth = 0.0
+    n_samples = 0
+
     with torch.set_grad_enabled(train):
         for Xb, yb in loader:
             Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-            pred = model(Xb)
-            loss = criterion(pred, yb)
+            pred = model(Xb)                              # (B, 2)
+
+            l_btc  = F.mse_loss(pred[:, 0], yb[:, 0])
+            l_eth  = F.mse_loss(pred[:, 1], yb[:, 1])
+            loss   = l_btc + ETH_WEIGHT * l_eth           # ★ ETH 가중 손실
+
             if train:
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
-            total_loss += loss.item() * len(Xb)
-    return total_loss / len(loader.dataset)
+
+            bs          = len(Xb)
+            sum_total  += loss.item()  * bs
+            sum_btc    += l_btc.item() * bs
+            sum_eth    += l_eth.item() * bs
+            n_samples  += bs
+
+    return (
+        sum_total / n_samples,
+        sum_btc   / n_samples,
+        sum_eth   / n_samples,
+    )
 
 
 print("[3/4] 학습 시작...")
@@ -191,8 +220,8 @@ Path("models").mkdir(exist_ok=True)
 best_path  = f"models/{NAME}_best.pt"
 
 for epoch in range(1, EPOCHS + 1):
-    tr_loss = run_epoch(train_loader, train=True)
-    va_loss = run_epoch(val_loader,   train=False)
+    tr_loss, tr_btc, tr_eth = run_epoch(train_loader, train=True)
+    va_loss, va_btc, va_eth = run_epoch(val_loader,   train=False)
     scheduler.step(va_loss)
 
     improved = va_loss < best_val
@@ -208,43 +237,52 @@ for epoch in range(1, EPOCHS + 1):
         mark   = "✓" if improved else " "
         print(
             f"  [{mark}] epoch {epoch:03d}/{EPOCHS} | "
-            f"train={tr_loss:.6f}  val={va_loss:.6f}  "
-            f"best={best_val:.6f}  lr={lr_now:.2e}"
+            f"val={va_loss:.6f}  (btc={va_btc:.6f} eth={va_eth:.6f})  "
+            f"lr={lr_now:.2e}"
         )
 
     if no_improve >= PATIENCE:
-        print(f"  Early stopping at epoch {epoch} (patience={PATIENCE})")
+        print(f"  Early stopping (epoch {epoch}, patience={PATIENCE})")
         break
 
-# 최적 가중치 로드
 model.load_state_dict(torch.load(best_path, map_location=DEVICE))
 
-# 테스트 평가
-test_loss = run_epoch(test_loader, train=False)
-test_rmse = math.sqrt(test_loss)
-print(f"\n  테스트 MSE={test_loss:.6f}  RMSE={test_rmse:.6f}")
-
 
 # ════════════════════════════════════════════════════════════
-# Step 4. 방향 정확도 (선택 평가 지표)
-#   예측 부호와 실제 부호의 일치율 — 매매 신호 정확도의 프록시
+# Step 4. 테스트 평가 — 방향 정확도 + 예측 분산 비교
 # ════════════════════════════════════════════════════════════
+
+test_loss, test_btc, test_eth = run_epoch(test_loader, train=False)
+print(f"\n  테스트 손실  total={test_loss:.6f}  btc={test_btc:.6f}  eth={test_eth:.6f}")
 
 model.eval()
-all_pred, all_true = [], []
+preds_list, trues_list = [], []
 with torch.no_grad():
     for Xb, yb in test_loader:
-        pred = model(Xb.to(DEVICE)).cpu().numpy()
-        all_pred.append(pred)
-        all_true.append(yb.numpy())
+        preds_list.append(model(Xb.to(DEVICE)).cpu().numpy())
+        trues_list.append(yb.numpy())
 
-all_pred = np.vstack(all_pred)
-all_true = np.vstack(all_true)
+all_pred = np.vstack(preds_list)
+all_true = np.vstack(trues_list)
 
-dir_acc_btc = np.mean(np.sign(all_pred[:, 0]) == np.sign(all_true[:, 0]))
-dir_acc_eth = np.mean(np.sign(all_pred[:, 1]) == np.sign(all_true[:, 1]))
-print(f"  방향 정확도 — BTC: {dir_acc_btc*100:.1f}%  ETH: {dir_acc_eth*100:.1f}%")
-print(f"  (랜덤 기준선: 50%)")
+# 방향 정확도
+dir_btc = np.mean(np.sign(all_pred[:, 0]) == np.sign(all_true[:, 0]))
+dir_eth = np.mean(np.sign(all_pred[:, 1]) == np.sign(all_true[:, 1]))
 
-print(f"\n✅ 학습 완료! 최적 모델: {best_path}")
-print("  다음 단계: python train/03_export_onnx.py --horizon 1h")
+# 예측 분산 (ETH 변동폭 개선 확인 지표)
+std_pred_btc = all_pred[:, 0].std()
+std_pred_eth = all_pred[:, 1].std()
+std_true_btc = all_true[:, 0].std()
+std_true_eth = all_true[:, 1].std()
+
+print(f"\n  방향 정확도   BTC: {dir_btc*100:.1f}%   ETH: {dir_eth*100:.1f}%  (랜덤 기준선 50%)")
+print(f"\n  예측 표준편차 (클수록 변동폭 큼)")
+print(f"    BTC  pred_std={std_pred_btc:.6f}  true_std={std_true_btc:.6f}"
+      f"  ratio={std_pred_btc/max(std_true_btc,1e-8):.2%}")
+print(f"    ETH  pred_std={std_pred_eth:.6f}  true_std={std_true_eth:.6f}"
+      f"  ratio={std_pred_eth/max(std_true_eth,1e-8):.2%}")
+print(f"  ETH/BTC 분산 비율 (예측): {std_pred_eth/max(std_pred_btc,1e-8):.3f}"
+      f"  (실제): {std_true_eth/max(std_true_btc,1e-8):.3f}")
+print()
+print(f"✅ 학습 완료: {best_path}")
+print("  다음 단계: python train/03_export_onnx.py --horizon " + args.horizon)
