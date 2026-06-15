@@ -12,12 +12,12 @@ ai/ai_engine.py — ONNX GRU 추론 엔진
 
 [사용 방법]
   # 폴링 (REST)
-  features = feature_builder.build(btc_candles, eth_candles)  # (N, 8)
+  features = feature_builder.build(btc_candles, eth_candles)  # (N, 10)
   engine.load_features(features)
   btc_ret, eth_ret = await engine.infer()   # 로그 수익률
 
   # 스트리밍 (WebSocket)
-  engine.push_feature_row(row)              # (8,) 행 하나
+  engine.push_feature_row(row)              # (10,) 행 하나
   btc_ret, eth_ret = await engine.infer()
 """
 
@@ -86,10 +86,10 @@ class AIEngine:
 
     def load_features(self, features: np.ndarray) -> None:
         """
-        FeatureBuilder.build() 결과 (N, 8) 배열을 받아 버퍼를 갱신합니다.
+        FeatureBuilder.build() 결과 (N, 10) 배열을 받아 버퍼를 갱신합니다.
         매 ingest 사이클 시작 시 호출.
         """
-        if features is None or features.ndim != 2 or features.shape[1] != 8:
+        if features is None or features.ndim != 2 or features.shape[1] != 10:
             logger.warning(f"[{self.model_name}] 잘못된 피처 shape: {getattr(features, 'shape', None)}")
             return
         self._buffer.clear()
@@ -102,10 +102,10 @@ class AIEngine:
 
     def push_feature_row(self, row: np.ndarray) -> None:
         """
-        완성된 캔들 1개에서 계산한 피처 벡터 (8,) 를 버퍼에 추가합니다.
+        완성된 캔들 1개에서 계산한 피처 벡터 (10,) 를 버퍼에 추가합니다.
         WS 모드에서 캔들 완성 콜백마다 호출.
         """
-        if row is None or row.shape != (8,):
+        if row is None or row.shape != (10,):
             return
         self._buffer.append(row.astype(np.float32))
 
@@ -127,7 +127,7 @@ class AIEngine:
         if self._mock:
             return self._mock_predict()
 
-        arr = np.array([list(self._buffer)], dtype=np.float32)  # (1, seq_len, 8)
+        arr = np.array([list(self._buffer)], dtype=np.float32)  # (1, seq_len, 10)
         try:
             output = await asyncio.to_thread(
                 self.session.run, None, {self.input_name: arr}
