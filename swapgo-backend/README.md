@@ -49,7 +49,3 @@ curl 'localhost:8000/explorer/verify?from=1'
 ```bash
 .venv/Scripts/python.exe -m pytest -q
 ```
-
-## 디렉토리
-
-자세한 설계는 plan 파일 참고: `C:\Users\MyungHoon\.claude\plans\distributed-beaming-widget.md`
