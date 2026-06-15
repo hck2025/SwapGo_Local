@@ -1,0 +1,34 @@
+
+> swapgo-frontend@0.1.0 dev
+> next dev --port 3000
+
+  ▲ Next.js 14.2.35
+  - Local:        http://localhost:3000
+  - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 6.4s
+ ○ Compiling / ...
+ ✓ Compiled / in 7s (1992 modules)
+ GET / 200 in 7497ms
+ ✓ Compiled in 361ms (973 modules)
+ ✓ Compiled /ai in 297ms (1984 modules)
+ GET /ai 200 in 437ms
+ ✓ Compiled /market in 395ms (1998 modules)
+ GET /market 200 in 536ms
+ ✓ Compiled /prices in 375ms (2004 modules)
+ GET /prices 200 in 472ms
+ GET / 200 in 92ms
+ GET /ai 200 in 60ms
+ GET /market 200 in 69ms
+ GET /market 200 in 43ms
+ ○ Compiling /portfolio ...
+ ✓ Compiled /portfolio in 542ms (2012 modules)
+ GET /market 200 in 212ms
+ GET / 200 in 40ms
+ ✓ Compiled /ai in 230ms (1038 modules)
+ GET /ai 200 in 385ms
+ ✓ Compiled /prices in 131ms (1042 modules)
+ ○ Compiling /history ...
+ ✓ Compiled /history in 540ms (2028 modules)
+ ✓ Compiled /explorer in 440ms (2040 modules)
