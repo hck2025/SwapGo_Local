@@ -1,23 +1,25 @@
 """
-ai/feature_builder.py — 캔들 데이터 → 모델 입력 8피처 변환기
+ai/feature_builder.py — 캔들 데이터 → 모델 입력 10피처 변환기
 
 [피처 정의 (모델 학습 순서와 정확히 일치)]
   idx  이름             계산 방법
   0    Ret_btc          log(close_t / close_t-1)                — BTC 로그 수익률
   1    Ret_eth          log(eth_close_t / eth_close_t-1)        — ETH 로그 수익률
-  2    Log_Pow_btc      log(volume_base + 1)                    — BTC 체결강도 근사
-                        ※ 정확한 체결강도는 /market/trades의 side 정보가 필요하나
-                           SwapGo OHLC 캔들에는 없으므로 volume_base 로 근사
-  3    Log_Trades_btc   log(trades_count + 1)                   — BTC 체결건수
+  2    Log_Pow_btc      log(volume_base + ε)                    — BTC 체결강도 근사
+  3    Log_Trades_btc   log(trades_count + ε)                   — BTC 체결건수
   4    Volat_btc        std(Ret_btc[-VOLAT_WINDOW:])             — BTC 단기 변동성
-  5    BB_Width         (upper - lower) / middle                — 볼린저 밴드 너비
-                        upper/lower = SMA±2σ (BB_PERIOD 캔들 기준)
-  6    Volume_btc       volume_base (raw, scaler 가 정규화)     — BTC 거래량
+  5    BB_Width_btc     4σ / SMA  (BB_PERIOD, BTC close)         — BTC 볼린저 밴드 너비
+  6    Volume_btc       volume_base (raw)                       — BTC 거래량
   7    Volume_eth       eth_volume_base (raw)                   — ETH 거래량
+  8    Volat_eth        std(Ret_eth[-VOLAT_WINDOW:])             — ETH 단기 변동성  ★추가
+  9    BB_Width_eth     4σ / SMA  (BB_PERIOD, ETH close)         — ETH 볼린저 밴드  ★추가
+
+  ★ ETH 전용 피처 2개 추가 (8 → 10)
+    ETH 출력 헤드에 전용 신호를 공급해 변동폭 작음 문제를 해결합니다.
 
 [입출력]
   입력: BTC 캔들 리스트 + ETH 캔들 리스트 (동일 interval, 동일 limit)
-  출력: np.ndarray shape (N, 8), scaler 적용 완료
+  출력: np.ndarray shape (N, 10), scaler 적용 완료
 
 [scaler.pkl]
   joblib 으로 직렬화된 sklearn scaler (MinMaxScaler / StandardScaler 등).
@@ -46,7 +48,7 @@ _LOG_EPS      = 1e-9  # log(0) 방지
 
 class FeatureBuilder:
     """
-    BTC + ETH 캔들 시퀀스를 받아 (N, 8) 피처 행렬을 반환합니다.
+    BTC + ETH 캔들 시퀀스를 받아 (N, 10) 피처 행렬을 반환합니다.
     scaler.pkl 이 있으면 자동 적용, 없으면 raw 값으로 Mock 모드 동작.
     """
 
@@ -74,10 +76,10 @@ class FeatureBuilder:
         eth_candles: list[dict],
     ) -> Optional[np.ndarray]:
         """
-        BTC·ETH 캔들 → (N, 8) 피처 행렬 (scaler 적용 완료).
+        BTC·ETH 캔들 → (N, 10) 피처 행렬 (scaler 적용 완료).
 
         반환값:
-          np.ndarray shape (N, 8) — N은 두 캔들 리스트 중 짧은 쪽 길이
+          np.ndarray shape (N, 10) — N은 두 캔들 리스트 중 짧은 쪽 길이
           None — 유효 캔들이 부족할 때
         """
         btc = [CandleData.from_dict(c) for c in btc_candles if float(c.get("close", 0)) > 0]
@@ -100,7 +102,7 @@ class FeatureBuilder:
         if not rows:
             return None
 
-        X = np.array(rows, dtype=np.float32)   # (N-1, 8)
+        X = np.array(rows, dtype=np.float32)   # (N-1, 10)
 
         # NaN/Inf 를 0 으로 대체
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -122,7 +124,7 @@ class FeatureBuilder:
         eth: list[CandleData],
         i: int,
     ) -> list[float]:
-        """인덱스 i 의 피처 벡터 (8개) 반환"""
+        """인덱스 i 의 피처 벡터 (10개) 반환"""
 
         # ① Ret_btc
         ret_btc = _log_return(btc[i - 1].close, btc[i].close)
@@ -136,18 +138,15 @@ class FeatureBuilder:
         # ④ Log_Trades_btc
         log_trades_btc = math.log(btc[i].trades_count + _LOG_EPS)
 
-        # ⑤ Volat_btc — 최근 VOLAT_WINDOW 개 수익률의 표준편차
+        # ⑤ Volat_btc — 최근 VOLAT_WINDOW 개 BTC 수익률의 표준편차
         start = max(1, i - _VOLAT_WINDOW + 1)
-        recent_rets = [
-            _log_return(btc[j - 1].close, btc[j].close)
-            for j in range(start, i + 1)
-        ]
-        volat_btc = float(np.std(recent_rets)) if len(recent_rets) > 1 else 0.0
+        btc_rets = [_log_return(btc[j-1].close, btc[j].close) for j in range(start, i+1)]
+        volat_btc = float(np.std(btc_rets)) if len(btc_rets) > 1 else 0.0
 
-        # ⑥ BB_Width — SMA±2σ 기반 볼린저 밴드 너비
+        # ⑥ BB_Width_btc — BTC 볼린저 밴드 너비
         bb_start = max(0, i - _BB_PERIOD + 1)
-        closes = [btc[j].close for j in range(bb_start, i + 1)]
-        bb_width = _bollinger_width(closes)
+        btc_closes = [btc[j].close for j in range(bb_start, i + 1)]
+        bb_width_btc = _bollinger_width(btc_closes)
 
         # ⑦ Volume_btc
         volume_btc = btc[i].volume_base
@@ -155,8 +154,17 @@ class FeatureBuilder:
         # ⑧ Volume_eth
         volume_eth = eth[i].volume_base
 
+        # ⑨ Volat_eth ★ — 최근 VOLAT_WINDOW 개 ETH 수익률의 표준편차
+        eth_rets = [_log_return(eth[j-1].close, eth[j].close) for j in range(start, i+1)]
+        volat_eth = float(np.std(eth_rets)) if len(eth_rets) > 1 else 0.0
+
+        # ⑩ BB_Width_eth ★ — ETH 볼린저 밴드 너비
+        eth_closes = [eth[j].close for j in range(bb_start, i + 1)]
+        bb_width_eth = _bollinger_width(eth_closes)
+
         return [ret_btc, ret_eth, log_pow_btc, log_trades_btc,
-                volat_btc, bb_width, volume_btc, volume_eth]
+                volat_btc, bb_width_btc, volume_btc, volume_eth,
+                volat_eth, bb_width_eth]
 
     # ── 상태 조회 ────────────────────────────────────────────
     def get_info(self) -> dict:
