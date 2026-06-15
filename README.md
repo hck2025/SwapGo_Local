@@ -1,5 +1,7 @@
 # SwapGo
 
+## ETH 값 변동폭 향상을 위해 8피처 -> 10피처로 ETH 피처 2개 추가한 ONNX를 적용한 브랜치입니다.
+
 SwapGo는 다음 세 개의 주요 구성 요소로 나뉩니다:
 
 - `swapgo-frontend` - Next.js 기반 웹 애플리케이션
