@@ -1,0 +1,34 @@
+[project]
+name = "swapgo-backend"
+version = "0.1.0"
+description = "SwapGo - Python AMM DEX backend (CPMM, learning-focused)"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "sqlalchemy>=2.0",
+    "coincurve>=18.0",
+    "eth-utils>=4.0",
+    "eth-account>=0.10",
+    "mnemonic>=0.20",
+    "pyjwt>=2.8",
+    "python-multipart>=0.0.7",
+    "httpx>=0.26",
+    "qrcode[pil]>=7.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]

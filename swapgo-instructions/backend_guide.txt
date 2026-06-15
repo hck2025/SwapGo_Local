@@ -1,0 +1,364 @@
+================================================================================
+  SwapGo 백엔드 사용설명서
+  (swapgo-backend / FastAPI + SQLite + SQLAlchemy 2)
+================================================================================
+
+[목차]
+  1. 무엇을 하는 서버인가
+  2. 폴더 구조 한눈에 보기
+  3. 설치 및 실행
+  4. 환경변수(.env)
+  5. 시드 데이터(자산/풀/용어/봇)
+  6. 응답 봉투 규약 + 에러 코드
+  7. REST API 한 페이지 정리
+  8. WebSocket 채널
+  9. 인증 흐름 3가지 (사용자 JWT / 봇 API 키 / 관리자 토큰)
+ 10. 데이터베이스 테이블
+ 11. 백그라운드 워커
+ 12. 테스트 실행
+ 13. 자주 막히는 지점
+
+================================================================================
+1. 무엇을 하는 서버인가
+================================================================================
+- Uniswap V2 식 CPMM (x*y=k) AMM DEX 모의투자/학습 플랫폼의 백엔드입니다.
+- 임시 지갑(secp256k1) + 챌린지-서명 로그인(EIP-191, MetaMask 호환).
+- 모든 거래는 체인형 해시 원장(prev_hash → tx_hash) + 머클루트 스냅샷.
+- 인증 없이도 누구나 거래 무결성을 재검증할 수 있는 공개 익스플로러 제공.
+- 슬리피지 자동 분류(safe / warning / danger)와 한국어 친절한 에러 메시지.
+- AI 팀 봇이 바로 꽂아 쓸 수 있는 `/ai/ingest/*` 와 `/ws` 채널 제공.
+
+================================================================================
+2. 폴더 구조 한눈에 보기
+================================================================================
+swapgo-backend/
+├─ run.py                 ← 서버 실행 스크립트 (자동 시드 옵션 포함)
+├─ pyproject.toml
+├─ .env.example
+├─ swapgo.db              ← SQLite (WAL 모드 .db-wal / .db-shm 포함)
+├─ app/
+│  ├─ main.py             ← FastAPI 인스턴스 + 라우터 등록 + lifespan(워커)
+│  ├─ config.py           ← Settings (pydantic-settings, .env 자동 로드)
+│  ├─ deps.py             ← DI (DB세션, 사용자 JWT, 봇 키, 관리자 토큰)
+│  ├─ api/
+│  │  ├─ envelope.py      ← {ok, data, error, server_time} 봉투 + 글로벌 핸들러
+│  │  ├─ ws.py            ← /ws WebSocket 엔드포인트 (멀티 채널 pub/sub)
+│  │  └─ v1/              ← 도메인별 REST 라우터 (auth, wallet, swap, …)
+│  ├─ schemas/            ← Pydantic 요청/응답 모델
+│  ├─ services/           ← 비즈니스 로직 (amm_engine, swap_service, …)
+│  ├─ db/
+│  │  ├─ base.py          ← engine / SessionLocal / init_schema()
+│  │  └─ models/          ← SQLAlchemy 2 Mapped 모델 (User/Wallet/Pool/…)
+│  ├─ core/               ← 도메인 무관 유틸 (crypto, hashing, errors, time …)
+│  ├─ seeders/            ← 자산/풀/용어/봇 시드 스크립트
+│  └─ workers/            ← 백그라운드 작업 (1분 캔들 / 머클 스냅샷)
+└─ tests/                 ← pytest (unit + e2e)
+
+================================================================================
+3. 설치 및 실행
+================================================================================
+[최초 1회]
+    cd C:\Users\MyungHoon\1\swapgo-backend
+    python -m venv .venv
+    .venv\Scripts\python.exe -m pip install -e ".[dev]"
+    copy .env.example .env
+
+[개발 서버 — 가장 쉬운 방법]
+    .venv\Scripts\python.exe run.py
+        → 0.0.0.0:8000 + 자동 reload + DB 비어있으면 자동 시드
+        → 콘솔에 "X-Bot-Key: xxxxx" 가 한 번만 출력 (꼭 복사 보관!)
+
+[수동 옵션]
+    python run.py --port 8080
+    python run.py --no-seed         (자동 시드 끄기)
+    python run.py --no-reload       (운영 모드)
+    python -m uvicorn app.main:app --reload --port 8000   (uvicorn 직접)
+
+[중요한 URL]
+    http://localhost:8000/docs        ← Swagger UI (Phase A 부터 모든 API 노출)
+    http://localhost:8000/health      ← 헬스체크
+    ws://localhost:8000/ws            ← WebSocket
+
+[Windows 런처]
+    swapgo-launcher.bat / swapgo-launcher.pyw   (프로젝트 루트 C:\Users\MyungHoon\1)
+        → 더블클릭 GUI 로 백엔드(:8000) + AI 엔진(:9000) + 프론트(:3000) 를
+          "전체 시작" 한 번에 기동/중지. 각 서버 상태(정상/시작중/중지)와 로그 표시.
+        → 자식 프로세스에 PYTHONIOENCODING=utf-8 을 주입하므로 Windows 콘솔(cp949)
+          에서도 이모지 로그로 인한 UnicodeEncodeError 없이 기동됩니다.
+
+================================================================================
+4. 환경변수 (.env)
+================================================================================
+JWT_SECRET=change-me-in-prod-please       ← 사용자 JWT 서명 비밀
+JWT_EXPIRE_MINUTES=1440                   ← 24시간
+DATABASE_URL=sqlite:///./swapgo.db        ← PG로 갈아끼울 수 있게 추상화
+FEE_BPS=30                                ← 풀 기본 수수료 0.30%
+SLIPPAGE_WARN_BPS=50                      ← 0.50% 이상이면 warning
+SLIPPAGE_DANGER_BPS=300                   ← 3.00% 이상이면 danger
+MERKLE_SNAPSHOT_INTERVAL_SEC=300          ← 5분마다 머클 스냅샷
+MERKLE_SNAPSHOT_BATCH=100                 ← 100건 쌓이면 즉시 스냅샷
+ADMIN_BOOTSTRAP_TOKEN=admin-bootstrap-change-me   ← 관리자 헤더 값
+CORS_ORIGINS=http://localhost:3000,http://localhost:5173
+
+값을 바꾸면 서버 재기동 필요 (Settings는 lru_cache).
+
+================================================================================
+5. 시드 데이터
+================================================================================
+[자동 시드]
+  run.py 가 부팅 시 Asset 테이블이 비어 있으면:
+    - seed_pools.run() → 자산 BTC/ETH/USDT + 풀 BTC/USDT, ETH/USDT
+    - seed_glossary.run() → 용어사전 K개
+    - seed_bot.run() → 기본 봇 1개 + API 키 1개 (raw key 콘솔에 1회 출력)
+
+[수동 시드 (curl)]
+  curl -X POST http://localhost:8000/admin/seed \
+       -H "x-admin-token: admin-bootstrap-change-me"
+
+[봇 키를 잃어버렸을 때]
+  새로운 키 발급:
+  curl -X POST http://localhost:8000/admin/bots \
+       -H "x-admin-token: admin-bootstrap-change-me" \
+       -H "Content-Type: application/json" \
+       -d '{"label":"my-bot","scopes":["bot:trade","bot:lp","bot:ingest"]}'
+
+[데모 상태 리셋 — reset_demo.py]
+  봇 테스트 거래로 풀 가격이 흐트러졌거나 차트를 깨끗한 베이스라인으로 되돌리고
+  싶을 때 사용합니다.
+    .venv\Scripts\python.exe reset_demo.py
+  하는 일: ① 풀 준비금을 시드 초기값으로 복원(BTC=43,250 / ETH=2,840)
+           ② 캔들 전체 + swap/bot_swap 트랜잭션 삭제
+           ③ 1m/5m/1h/1d 캔들을 :00 경계에 맞춰 재시드(현재가에 수렴)
+  봇/유저/API 키는 건드리지 않으므로 엔진 .env 의 봇 키는 그대로 유효합니다.
+
+================================================================================
+6. 응답 봉투 규약 + 에러 코드
+================================================================================
+모든 응답이 동일한 봉투로 감싸집니다 (app/api/envelope.py):
+
+  성공:
+    { "ok": true,
+      "data": { ... },
+      "error": null,
+      "server_time": "2026-04-30T12:34:56.789Z" }
+
+  실패:
+    { "ok": false,
+      "data": null,
+      "error": {
+        "code": "SLIPPAGE_EXCEEDED",
+        "message": "허용 슬리피지를 초과했어요.",
+        "suggestion": "수량을 줄이거나 허용치를 ↑하세요.",
+        "glossary_keys": ["slippage", "price_impact"],
+        "details": { ... }
+      },
+      "server_time": "..." }
+
+자주 쓰이는 에러 코드 (app/core/errors.py):
+  UNAUTHORIZED, FORBIDDEN, VALIDATION_ERROR, INVALID_AMOUNT,
+  INSUFFICIENT_BALANCE, INSUFFICIENT_LIQUIDITY, POOL_INACTIVE,
+  SLIPPAGE_EXCEEDED, STALE_QUOTE, NOT_FOUND, INTERNAL_ERROR
+
+프론트는 error.code 로 분기, error.message + error.suggestion 으로 토스트,
+error.glossary_keys 로 용어사전 팝오버를 띄우면 됩니다.
+
+================================================================================
+7. REST API 한 페이지 정리 (prefix는 /<tag>)
+================================================================================
+[ /auth ]                                        ← 인증 불필요
+  POST  /auth/signup            임시지갑 생성 + 개인키/니모닉 1회 반환
+  POST  /auth/challenge         로그인 nonce + 서명 메시지 발급
+  POST  /auth/login             서명 검증 후 JWT 발급
+  POST  /auth/logout            stateless (클라가 토큰 폐기)
+
+[ /wallet ]                       ← Bearer 사용자 토큰 또는 X-Bot-Key(공용)
+  GET   /wallet/me              내 잔고 + 주소           (사람/봇 공용)
+  GET   /wallet/holdings        보유자산 + 평균매수가 + 평가손익(수익률)  (사람/봇 공용)
+  POST  /wallet/deposit/mock    모의 입금 (즉시 적립)    (사람/봇 공용) body: {symbol, amount}
+  POST  /wallet/withdraw/mock   모의 출금                (사람 전용)
+  GET   /wallet/qr?symbol=USDT  입금 QR 데이터           (사람 전용)
+    ※ /wallet/me·/holdings·/deposit/mock 은 wallet_actor 의존성으로 X-Bot-Key 도 받습니다.
+    ※ /wallet/holdings 응답: { total_value_quote_human, total_invested_quote_human,
+      total_pnl_value_human, total_pnl_pct, items:[{symbol, amount_human,
+      current_price_human, value_quote_human, avg_cost_human, invested_quote_human,
+      pnl_value_human, pnl_pct}] }. app/services/holdings_service.py 가 거래 원장을
+      시간순 재생해 자산별 이동평균 매수단가(USDT)를 구한다: 매수 스왑=지불 USDT 가 원가,
+      매도=평균단가로 차감, 코인 입금=입금 시점 1m 캔들가로 평가, USDT 는 손익 제외.
+
+[ /pools ]                                       ← 인증 불필요
+  GET   /pools                  전체 풀
+  GET   /pools/{id}             풀 상세
+
+[ /swap ]                        ← /quote 공개, /execute Bearer 또는 X-Bot-Key(bot:trade)
+  POST  /swap/quote             견적(amount_out, price_impact, slippage_level…)
+  POST  /swap/execute           실제 스왑 실행 (잔고/풀/원장 원자적 갱신)
+    ※ /execute 는 사람(JWT)과 봇(X-Bot-Key, scope bot:trade)이 공유합니다.
+      side=base_to_quote 면 amount_in_human 은 base(BTC) 수량, quote_to_base 면
+      quote(USDT) 수량입니다(단위 혼동 주의).
+
+[ /liquidity ]                                   ← 대부분 Bearer
+  POST  /liquidity/quote-add    공급 견적 (필요 quote 수량 / 발행 지분)
+  POST  /liquidity/add          유동성 공급
+  POST  /liquidity/remove       유동성 회수
+  GET   /liquidity/positions    내 LP 포지션
+
+[ /market ]                                      ← 인증 불필요
+  GET   /market/coins           코인 카드용 (price/24h/스파크라인)
+  GET   /market/global          시총·도미넌스 등 전역 통계
+  GET   /market/orderbook       AMM 합성 호가창
+  GET   /market/trades          최근 체결
+
+[ /chart ]                                       ← 인증 불필요
+  GET   /chart/ohlc             1m/5m/1h/1d 캔들
+  GET   /chart/ticker           24h ticker (high/low/change/volume)
+
+[ /ai ]                                          ← 조회 공개, /ingest는 봇 키
+  GET   /ai/signals             최신 매매 신호 (limit ≤ 200)
+  GET   /ai/predictions         가격 예측 (horizon=1h|24h|7d)
+  GET   /ai/sentiment?symbol=…  최신 시장 심리
+  POST  /ai/ingest/signals      ← 봇 전용 (scope: bot:ingest)
+  POST  /ai/ingest/predictions  ← 봇 전용
+  POST  /ai/ingest/sentiment    ← 봇 전용
+
+[ /me ]                                          ← Bearer
+  GET   /me/transactions        본인 거래내역 (페이지/필터)
+  GET   /me/transactions.csv    CSV 다운로드
+  GET   /me/stats               총거래/수수료/볼륨
+
+[ /explorer ]                                    ← 전부 인증 불필요(공개)
+  GET   /explorer/tx/{id}                  단일 거래 + 친절한 설명
+  GET   /explorer/blocks?from=&to=         체인 블록 리스트
+  GET   /explorer/wallet/{address}         지갑별 거래
+  GET   /explorer/pools/{id}/history       풀별 거래
+  GET   /explorer/merkle/latest            최신 머클 스냅샷
+  GET   /explorer/verify?from=&to=         체인 무결성 재계산
+
+[ /glossary ]                                    ← 인증 불필요
+  GET   /glossary               전체 용어
+  GET   /glossary/search?q=…    검색
+  GET   /glossary/{key}         단건 조회
+
+[ /admin ]                                       ← x-admin-token 필요
+  POST  /admin/assets           자산 추가
+  POST  /admin/pools            풀 생성 (init_base/init_quote 필요)
+  POST  /admin/bots             봇 + API 키 발급 (raw 1회 노출)
+  POST  /admin/glossary/reload  용어 다시 로드
+  POST  /admin/seed             원클릭 시드
+
+================================================================================
+8. WebSocket 채널 ( /ws )
+================================================================================
+연결 직후 서버가 hello 메시지로 사용 가능 채널 목록을 알려줍니다.
+
+[클라 → 서버]
+  {"op":"subscribe","channels":["pool:1","trades:1","ohlc:1:1m","ai:signals"]}
+  {"op":"unsubscribe","channels":["pool:1"]}    또는 channels 생략시 전체 해제
+  {"op":"ping"}                                  → {"type":"pong"}
+
+[채널 종류]
+  pool:{id}            풀 reserve / price / revision 갱신
+  trades:{id}          새 체결
+  ohlc:{id}:{interval} 캔들 갱신 (1m/5m/1h/1d 전 구간, 5초마다 push)
+  orderbook:{id}       (예약) 합성 호가 변경
+  ai:signals           새 시그널
+  ai:predictions       새 예측
+  ai:sentiment         새 심리
+  me:{address}         (예약) 개인 알림
+
+[메시지 형식]
+  {"channel":"trades:1","type":"trade","tx_id":42,"side":"quote_to_base", ...}
+
+내부 구현은 app/services/notifier.py 의 인-프로세스 Hub. 추후 Redis pubsub
+으로 자연스럽게 교체 가능합니다.
+
+================================================================================
+9. 인증 흐름 3가지
+================================================================================
+■ 사용자 (JWT, Bearer)
+  1) POST /auth/signup → 서버가 secp256k1 키페어 생성, private_key_ONCE 1회 응답
+  2) POST /auth/challenge {address}  → nonce + EIP-191 message 반환
+  3) 클라가 wallet.signMessage(message)  (ethers.js, MetaMask 모두 OK)
+  4) POST /auth/login {address, signature, nonce}  → access_token 발급
+  5) 이후 모든 보호 라우트에 Authorization: Bearer <token>
+
+■ 봇 (API Key)
+  - 시드 시 콘솔에 한 번만 노출되는 raw key를 사용
+  - 헤더: X-Bot-Key: <raw>   또는   Authorization: Bearer <raw>
+  - DB에는 sha256(raw) 만 저장됨
+  - 스코프: bot:trade / bot:lp / bot:ingest 중 일부 또는 전부
+    require_scope("bot:ingest") 가 걸린 라우트는 해당 스코프 필요
+
+■ 관리자
+  - 헤더: x-admin-token: <ADMIN_BOOTSTRAP_TOKEN 환경변수 값>
+  - /admin/* 전체에 적용
+
+================================================================================
+10. 데이터베이스 테이블 (app/db/models/)
+================================================================================
+  users               id, display_name, role(user|bot), created_at
+  wallets             id, user_id, public_key, address(unique)
+  assets              symbol(PK), name, decimals, logo_url
+  balances            (wallet_id, asset_symbol) 잔고 raw 정수
+  pools               id, base_symbol, quote_symbol, reserve_*, fee_bps,
+                      revision (낙관적 락), is_active
+  liquidity_positions wallet_id, pool_id, shares
+  transactions        체인형 원장: prev_hash, tx_hash, payload_json,
+                      tx_type(swap|bot_swap|deposit|withdraw|add_liq|remove_liq)
+  candles             (pool_id, interval, bucket_start) OHLCV
+  merkle_snapshots    from_tx_id, to_tx_id, merkle_root, tx_count
+  api_keys            user_id, key_hash, scopes(JSON), revoked_at
+  nonces              로그인 챌린지 1회용
+  ai_signals          symbol, side(buy|sell|hold), confidence, reason, source
+  ai_predictions      symbol, horizon(1h|24h|7d), predicted/lower/upper
+  ai_sentiments       symbol, sentiment_score(-100~100), rsi, macd, ma7, ma25
+  glossary_terms      key, term_ko/en, short/long_desc, related_keys
+
+수량은 모두 raw 정수(=10^decimals 적용 후)로 저장됩니다. 응답 시 *_human
+필드로 사람이 읽는 단위로 변환됩니다 (app/core/amount.py).
+
+================================================================================
+11. 백그라운드 워커 (lifespan에서 자동 기동)
+================================================================================
+  candle_aggregator.py   5초마다 각 풀의 1m/5m/1h/1d 진행 중 버킷을 재집계하고
+                         ohlc:{id}:{interval} 채널로 푸시. 진행 중 캔들이 거의 실시간
+                         으로 자란다(프론트 폴링 주기와 일치). chart_service.aggregate_bucket
+                         사용. 같은 (pool,interval,bucket) 중복 INSERT 방지를 위해
+                         버킷을 set 으로 dedupe 한다.
+  merkle_snapshotter.py  300초마다 또는 100건 누적 시 머클루트 스냅샷 저장
+
+stop_event 가 set 되면 timeout 으로 종료됩니다.
+
+[가격 스케일 — chart_service]
+  캔들 close / ticker last_price 는 사람단위 가격으로 제공됩니다:
+    price_human = (reserve_quote / reserve_base) × 10^(base_decimals − quote_decimals)
+  (BTC8/USDT6 → ×100). 이 보정을 빠뜨리면 차트가 raw 비율(~432)로 찍혀 시드 캔들
+  (~43,250)과 100배 어긋나 폭락처럼 보입니다. _price_scale()/_swap_price_from_payload()
+  가 이를 구현하고, 저장 시 6자리로 양자화합니다(_q).
+
+================================================================================
+12. 테스트
+================================================================================
+    cd swapgo-backend
+    .venv\Scripts\python.exe -m pytest -q
+
+  tests/unit/         AMM 엔진, 원장, 호가합성, 암호화 단위 테스트
+  tests/e2e/          /auth → /swap 전체 플로우, 글로서리/익스플로러
+  tests/conftest.py   임시 SQLite + TestClient 픽스처
+
+================================================================================
+13. 자주 막히는 지점
+================================================================================
+- "풀이 없다" 에러 → /admin/seed 를 먼저 호출하세요.
+- 서명 검증 실패 → ethers v6 에서 Wallet.signMessage(message) 가 EIP-191
+  personal_sign 과 동일. 메시지 string 그대로 사용.
+- StaleQuote (409) → /swap/quote 와 /swap/execute 사이에 풀 revision 이
+  바뀌면 발생. 클라이언트는 /quote 를 다시 호출.
+- DB 락 → SQLite + WAL 모드라 동시 쓰기는 직렬화됩니다. 부하가 커지면
+  PG 로 전환 (DATABASE_URL 만 바꾸면 됨).
+- 봇 키 분실 → /admin/bots 로 새로 발급. 기존 키는 revoked_at 갱신해 폐기.
+- CORS → CORS_ORIGINS 에 프론트 도메인 추가 후 서버 재기동.
+- /explorer/verify 가 "무결성 위반"(first_invalid_id) → 트랜잭션을 중간에서 삭제하면
+  prev_hash→tx_hash 해시 체인이 끊긴다(원장은 append-only 설계라 삭제 금지). 복구는
+  ledger_service.rechain_ledger(db) 로 genesis 부터 체인을 재계산(payload 보존, 링크만
+  재연결, 머클 스냅샷 비움). reset_demo.py 가 캔들만 비우고 이 복구를 자동 호출하므로,
+  데모를 깨끗이 되돌릴 땐 reset_demo.py 를 쓰면 체인이 항상 유효하게 유지된다.

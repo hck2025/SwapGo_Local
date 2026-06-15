@@ -1,0 +1,547 @@
+================================================================================
+  SwapGo — AI팀 통합 가이드
+  (이 백엔드/프론트를 어떻게 활용할지에 대한 자세한 설명)
+================================================================================
+
+이 문서는 AI팀(혹은 트레이딩 봇팀)이 SwapGo 백엔드를 활용해서
+  (a) 시장 데이터를 가져와 모델을 학습/추론하고
+  (b) 결과를 다시 백엔드로 업로드해 프론트의 /ai 페이지에 노출시키며
+  (c) 실제로 봇이 모의 거래를 자동 실행하는 데까지
+필요한 모든 통합 절차와 참고 정보를 담았습니다.
+
+★ 이 가이드의 "참조 구현체" 는 **swapgo-engine** 폴더입니다.
+  - swapgo-engine = AI 엔진/봇 서버(FastAPI, 포트 :9000, 자체 .venv, Python 3.12).
+  - ONNX(GRU) 모델 4종으로 추론하고, 아래 (a)(b)(c) 를 봇 태스크로 자동 수행합니다.
+  - 즉 이 문서의 API 계약을 그대로 코드로 옮긴 것이 swapgo-engine 이며,
+    새 봇을 만들 땐 swapgo-engine/bots/*.py 를 그대로 참고/복제하면 됩니다.
+  - 엔진 자체 구조·실행법은 13장(맨 아래)에 정리했습니다.
+
+────────────────────────────────────────────────────────────────────────────────
+[목차]
+  1. 한눈에 보는 통합 그림
+  2. AI팀이 활용 가능한 데이터 소스 (조회 API)
+  3. AI팀이 결과를 올리는 곳 (Ingest API)
+  4. 봇 자동거래 (스왑/유동성) 흐름
+  5. 인증 — 봇 API 키 발급과 보관
+  6. WebSocket 활용 — 폴링이 아닌 푸시
+  7. 단위(decimals) 처리 규칙
+  8. 권장 봇 아키텍처 (3가지 패턴)
+  9. 백테스트/오프라인 학습용 데이터 추출
+ 10. 프론트 /ai 페이지가 기대하는 스키마 (UI 와의 계약)
+ 11. 운영 체크리스트와 흔한 실수
+ 12. 빠른 시작 — 5분짜리 파이썬 봇 예시
+ 13. swapgo-engine — 이 가이드의 참조 구현체 (구조·실행·봇 목록)
+────────────────────────────────────────────────────────────────────────────────
+
+================================================================================
+1. 한눈에 보는 통합 그림
+================================================================================
+
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │  AI팀 (외부 또는 같은 네트워크)                                     │
+   │                                                                     │
+   │   [데이터 수집 / 학습] ──→  [추론 모델]                              │
+   │           │                       │                                 │
+   │           │ 가격/체결/캔들 풀링    │ buy/sell/hold,                  │
+   │           ▼                       │ 가격 예측, 심리                 │
+   │   ┌──────────────┐                │                                 │
+   │   │ /market/*    │                ▼                                 │
+   │   │ /chart/*     │       ┌────────────────┐    [선택]               │
+   │   │ /pools       │       │ /ai/ingest/*   │  /swap/execute          │
+   │   │ /explorer/*  │       │ POST           │  실제 모의거래도        │
+   │   └──────────────┘       └────────────────┘  봇 키로 가능           │
+   │                                                                     │
+   └────────────────────────────────────┬────────────────────────────────┘
+                                        │
+                                        ▼
+                       SwapGo 백엔드 (FastAPI :8000)
+                                        │
+                                        ▼
+                  프론트 /ai 페이지 + 거래 화면 / 익스플로러
+
+요점:
+  - 데이터 IN: GET /market/*, /chart/*, /pools, /explorer/* (전부 인증 X)
+  - 결과 OUT: POST /ai/ingest/* (봇 API 키 + scope: bot:ingest)
+  - 거래 실행: POST /swap/execute (봇 API 키 + scope: bot:trade) — ✅ 정식 지원
+       · 봇 자금 충전: POST /wallet/deposit/mock, 잔고 조회: GET /wallet/me
+         → 셋 다 X-Bot-Key 로 호출 가능(사람 JWT 와 공용). swapgo-engine 은
+           부팅 시 자동으로 모의 입금해 봇 지갑을 채운 뒤 거래를 시작합니다.
+  - 실시간: WebSocket /ws  (channels: pool:*, trades:*, ohlc:*, ai:*)
+       · ohlc 는 1m/5m/1h/1d 전 구간이 5초마다 갱신됩니다.
+
+================================================================================
+2. AI팀이 활용 가능한 데이터 소스 (조회 API)
+================================================================================
+
+[코인 카드 데이터 — 마켓 화면이 사용하는 것과 동일]
+    GET /market/coins
+    → { coins: [
+          { symbol, name, price_human, change_24h_pct,
+            volume_24h_human, sparkline:[...30..], pool_id }, ...
+       ]}
+
+[전역 시장 통계]
+    GET /market/global
+    → total_market_cap_usdt_human, total_volume_24h_usdt_human,
+      btc_dominance_pct, eth_dominance_pct, note
+
+[캔들(OHLCV)]
+    GET /chart/ohlc?pool_id=1&interval=1m&limit=200
+    GET /chart/ohlc?pool_id=1&interval=5m&from=2026-04-29T00:00:00&to=...
+    → { pool_id, interval, candles:[{
+          bucket_start, open, high, low, close,
+          volume_base, volume_quote, trades_count }] }
+    interval ∈ {1m, 5m, 1h, 1d}
+
+[24시간 ticker]
+    GET /chart/ticker?pool_id=1
+    → { last_price, high_24h, low_24h, change_24h_pct,
+        volume_24h_base, volume_24h_quote }
+
+[합성 호가창 (AMM 풀로부터 단계별 가격을 시뮬한 가상 오더북)]
+    GET /market/orderbook?pool_id=1&levels=20&step_pct=0.001
+    → { pool_id, mid, bids:[{price,size,cum_size}], asks:[…], revision }
+
+[최근 체결]
+    GET /market/trades?pool_id=1&limit=200
+    → 슬리피지 등급 포함된 체결 리스트
+
+[풀 상태 (reserve, fee, revision)]
+    GET /pools
+    GET /pools/{id}
+
+[원장(거래) — 무결성 보장된 데이터셋]
+    GET /explorer/blocks?from=1&to=10000&limit=500
+    GET /explorer/pools/{pool_id}/history?limit=500
+    GET /explorer/wallet/{address}?limit=200
+    GET /explorer/verify?from=1&to=...   (체인 무결성 재계산 결과 확인)
+    각 tx 는 prev_hash → tx_hash 로 연결. payload_json 에 raw 메타.
+
+[용어사전 (모델/UI 메타)]
+    GET /glossary
+    GET /glossary/{key}
+
+✱ 위 GET 들은 **모두 인증 불필요**. 봇이든 노트북이든 그냥 호출 가능.
+
+================================================================================
+3. AI팀이 결과를 올리는 곳 (Ingest API)
+================================================================================
+
+다음 3개 엔드포인트는 봇 API 키(scope: bot:ingest)를 헤더로 요구합니다.
+   X-Bot-Key: <raw>     또는    Authorization: Bearer <raw>
+
+[POST /ai/ingest/signals]            ← 매매 신호
+  body:
+    { "items": [
+        { "symbol": "BTC",
+          "side": "buy" | "sell" | "hold",
+          "confidence": 0.0 ~ 1.0,
+          "reason": "RSI 35, 골든크로스 임박",      // optional
+          "expires_in_sec": 3600                    // optional
+        }, ...
+      ] }
+  resp: { ok:true, data:{ inserted: N } }
+
+[POST /ai/ingest/predictions]        ← 가격 예측
+  body:
+    { "items": [
+        { "symbol": "ETH",
+          "horizon": "1h" | "24h" | "7d",
+          "predicted_price_human": "2950.5",
+          "lower_bound_human": "2900",      // optional
+          "upper_bound_human": "3000",      // optional
+          "confidence": 0.62,
+          "model_tag": "lstm-v3"            // optional
+        }, ...
+      ] }
+
+[POST /ai/ingest/sentiment]          ← 시장 심리 / 보조 지표
+  body:
+    { "items": [
+        { "symbol": "BTC",
+          "sentiment_score": -100 ~ 100,    // 음수=약세, 양수=강세
+          "rsi": 56.3,                      // optional
+          "macd": -0.42,                    // optional
+          "ma7_human": "43210.5",           // optional
+          "ma25_human": "42950.8",          // optional
+          "extra_json": "{...}"             // optional, JSON 문자열로 자유 필드
+        }, ...
+      ] }
+
+[조회용 (인증 X) — 프론트가 쓰는 것과 동일]
+  GET /ai/signals?symbol=BTC&limit=50
+  GET /ai/predictions?symbol=ETH&horizon=24h&limit=50
+  GET /ai/sentiment?symbol=BTC
+
+✱ 인서트 즉시 프론트 /ai 페이지에 반영됩니다(폴링 5~10초).
+✱ 같은 symbol 로 여러 번 보내도 누적 저장. 프론트는 가장 최신을 표시.
+
+================================================================================
+4. 봇 자동거래 흐름
+================================================================================
+봇이 직접 모의 거래까지 한다면 일반 사용자와 동일한 흐름을 따릅니다.
+/swap/execute · /wallet/deposit/mock · /wallet/me 는 모두 X-Bot-Key(scope: bot:trade)
+로 호출 가능합니다 — 사람 사용자와 봇이 같은 엔드포인트를 공유합니다.
+
+  (1) 봇 키로 잔고 확인 + 자가 충전
+       GET /wallet/me
+       헤더: X-Bot-Key: <raw>
+        → 봇은 시드시 자체 wallet 이 함께 생성됨 (default-bot)
+        → 잔고가 비었으면 /wallet/deposit/mock 으로 모의 입금
+            body: { "symbol": "BTC", "amount": "1000" }   // 필드명은 amount
+          ※ 매도(base→quote)에는 base 자산(BTC), 매수(quote→base)에는 quote 자산
+            (USDT)이 필요하므로 거래할 풀의 양쪽 자산을 모두 채워야 합니다.
+          ※ swapgo-engine 은 ENABLE_TRADE_BOTS=true 이면 부팅 시 자동으로
+            BTC/USDT 를 모의 입금합니다(main._ensure_trade_funds).
+
+  (2) 견적
+       POST /swap/quote
+       body: {
+         "pool_id": 1,
+         "side": "quote_to_base" | "base_to_quote",
+         "amount_in_human": "100",
+         "slippage_tolerance_bps": 100         // 1.00%, null이면 자동
+       }
+       resp.slippage_level ∈ {safe, warning, danger} 를 보고 임계 결정.
+
+  (3) 실행
+       POST /swap/execute (scope: bot:trade)
+       body: {
+         "pool_id": 1, "side": "...",
+         "amount_in_human": "100",
+         "min_amount_out": <quote.amount_out_min>,
+         "slippage_tolerance_bps": <quote.slippage_threshold_used_bps>,
+         "expected_revision": <quote.pool_after.revision>   // 옵티미스틱 락
+       }
+       409 STALE_QUOTE 가 오면 풀이 그 사이 변경된 것 → /quote 부터 재시도.
+
+       ※ amount_in_human 의 단위는 side 에 따라 다릅니다(가장 흔한 실수):
+           base_to_quote(매도) → amount 는 base(BTC) 수량
+           quote_to_base(매수) → amount 는 quote(USDT) 수량
+         양쪽에 같은 숫자를 쓰면 한쪽이 풀 대비 과대해져 슬리피지 danger 로
+         항상 스킵되거나(예: BTC 5개 매도) 다른 쪽은 무의미해집니다(USDT 5개 매수).
+         swapgo-engine 은 base 수량을 기준으로 잡고 매수 시 base수량×현재가 로
+         환산해 양방향 거래량을 맞춥니다(bots/bot_a_trade.py 참고).
+
+  (4) 결과는 자동으로 거래 원장에 기록 (tx_type="bot_swap")
+      익스플로러 /explorer/tx/{id} 에서 누구나 검증 가능.
+
+[유동성 공급도 가능] (scope: bot:lp)
+   POST /liquidity/quote-add → /liquidity/add → /liquidity/remove
+
+================================================================================
+5. 인증 — 봇 API 키 발급과 보관
+================================================================================
+[자동 시드된 기본 봇]
+  서버 첫 부팅 시 콘솔에 한 번만 다음 형태로 표시됩니다:
+      [bot] 기본 봇 API 키 (이 메시지는 한 번만 표시됩니다):
+            X-Bot-Key: zX8s...t4Pq
+            scopes:    ['bot:trade', 'bot:lp', 'bot:ingest']
+  → 이 raw 키를 ENV / 시크릿매니저에 보관하세요. DB엔 sha256 만 남습니다.
+
+[잃어버렸거나 새 봇이 필요할 때]
+  관리자 토큰으로 발급:
+    curl -X POST http://localhost:8000/admin/bots \
+         -H "x-admin-token: admin-bootstrap-change-me" \
+         -H "Content-Type: application/json" \
+         -d '{"label":"signal-bot","scopes":["bot:ingest"]}'
+  응답의 api_key_ONCE 가 raw 키. **표시 직후가 마지막**입니다.
+
+[헤더 사용]
+  X-Bot-Key: <raw>             ← 권장
+  또는 Authorization: Bearer <raw>
+
+[스코프 가이드]
+  bot:ingest   /ai/ingest/* 호출용 (시그널/예측/심리 업로드)
+  bot:trade    /swap/execute 등 자동거래 실행
+  bot:lp       /liquidity/* 유동성 공급/회수
+
+원칙: 가장 작은 스코프만 부여 (시그널만 올리면 bot:ingest 만).
+
+================================================================================
+6. WebSocket 활용
+================================================================================
+폴링도 충분하지만, 실시간 반응형 모델이라면 WS 가 효율적입니다.
+
+  ws://localhost:8000/ws
+
+  → 연결 시 hello 메시지로 사용 가능 채널 안내됨.
+  → 구독:
+       { "op":"subscribe",
+         "channels":[ "pool:1", "trades:1", "ohlc:1:1m" ] }
+  → 해제: { "op":"unsubscribe","channels":["pool:1"] }
+  → ping/pong 으로 keepalive.
+
+[채널별 메시지]
+  pool:{id}             reserve_base/quote, price, revision 변경 시
+  trades:{id}           체결: tx_id, side, amount_in/out, price, slippage_bps, ts
+  ohlc:{id}:{interval}  캔들 갱신 시 (open/high/low/close/volume_*).
+                        백엔드 워커가 5초마다 1m/5m/1h/1d 진행 중 버킷을 재집계해
+                        push 하므로, 구독은 ohlc:1:1m, ohlc:1:5m … 형태로 합니다.
+  ai:signals            /ai/ingest/signals 직후 (※ 현재 hub 자동 publish 는 미구현,
+                        필요 시 ai_ingest_service 에서 publish_sync 추가하면 됨)
+
+[활용 패턴]
+  - 새 캔들이 도착할 때마다 모델 forward → /ai/ingest/signals 로 즉시 업로드
+  - trades 스트림에서 큰 슬리피지 트리거를 잡아 alarm/sentiment 갱신
+
+================================================================================
+7. 단위(decimals) 처리 규칙 — 매우 중요
+================================================================================
+백엔드는 내부에서 모든 수량을 **raw 정수**로 저장합니다.
+  - USDT decimals=6 → 1 USDT = 1_000_000
+  - BTC  decimals=8 → 1 BTC  = 100_000_000
+  - ETH  decimals=18 → 1 ETH = 1e18
+
+응답에는 두 종류 필드가 함께 옵니다.
+  reserve_base       (raw 정수, 문자열)
+  reserve_base_human ("100" 같은 사람단위 소수 문자열)
+
+[ingest 시 약속]
+  - signals/sentiment 의 ma7_human / ma25_human : **사람단위 소수 문자열** 입력.
+    백엔드가 자동으로 to_base_units(decimals) 적용해 정수로 저장.
+  - predictions 의 predicted_price_human / lower / upper : 마찬가지.
+  - confidence 는 0.0 ~ 1.0 (퍼센트가 아님).
+  - sentiment_score 는 -100 ~ 100 정수.
+  - 잘못된 decimals 사용 시 가격이 10^N 배 어긋남 — 가장 흔한 버그입니다.
+
+[조회 응답에서]
+  /ai/predictions, /ai/sentiment 응답의 predicted_price / ma7 / ma25 등은
+  사람단위 문자열로 다시 변환되어 옵니다. (raw로 받고 싶으면 직접 DB접근.)
+
+[가격(price) 스케일 규약 — 차트/티커]
+  AMM 풀의 사람단위 가격은 준비금 raw 비율에 decimals 차이를 보정한 값입니다:
+      price_human = (reserve_quote / reserve_base) × 10^(base_decimals − quote_decimals)
+  BTC(8)/USDT(6) 풀이면 ×100. 즉 raw 비율 432.5 → 사람가격 43,250 USDT/BTC.
+  /chart/ohlc 의 candle.close, /chart/ticker 의 last_price 는 모두 이 보정이 적용된
+  사람단위 가격입니다. 직접 reserve 로 가격을 계산할 때 이 ×10^(bdec−qdec) 보정을
+  빼면 100배 어긋나므로 주의(차트가 절벽처럼 폭락하는 전형적 버그).
+
+================================================================================
+8. 권장 봇 아키텍처 (3가지 패턴)
+================================================================================
+
+[패턴 A] 신호만 올리는 가벼운 봇  (가장 권장 — bot:ingest 만)
+  while True:
+      candles  = GET /chart/ohlc?pool_id=1&interval=5m&limit=200
+      ticker   = GET /chart/ticker?pool_id=1
+      sentiment_extra = (외부 뉴스/트위터 API)
+      pred = my_model.infer(candles, ticker, sentiment_extra)
+      POST /ai/ingest/signals     items=[{symbol,side,confidence,reason}]
+      POST /ai/ingest/predictions items=[{symbol,horizon,predicted_price_human,...}]
+      POST /ai/ingest/sentiment   items=[{symbol,sentiment_score,rsi,macd,ma7_human,...}]
+      sleep(60)
+
+[패턴 B] 신호 + 자동거래  (bot:ingest + bot:trade)
+  - 패턴 A 에 추가로 confidence > 0.7 일 때 /swap/quote → /swap/execute.
+  - StaleQuote 재시도, slippage_level=danger 면 스킵 등 가드레일 필수.
+  - 봇 자체 잔고는 /wallet/deposit/mock 으로 채움 (모의환경).
+
+[패턴 C] 시장조성형 LP 봇  (bot:lp)
+  - reserve_*, mid 가격, 24h 변동률을 보고 /liquidity/add 로 공급
+  - 사용자 거래로 인한 IL(impermanent loss) 분석 데이터 자동 생성
+
+================================================================================
+9. 백테스트/오프라인 학습용 데이터 추출
+================================================================================
+이 백엔드의 가장 큰 장점은 **모든 거래가 hash chain + 머클** 로 변조 불가능
+하다는 점입니다. 학습 데이터셋의 무결성을 외부에서 검증 가능합니다.
+
+[캔들 일괄 추출]
+  for pool_id in [1, 2]:
+      for iv in ["1m", "5m", "1h", "1d"]:
+          GET /chart/ohlc?pool_id={pool_id}&interval={iv}&limit=1000
+          (필요시 from/to 로 페이징)
+
+[원시 체결 일괄 추출]
+  GET /explorer/pools/{pool_id}/history?limit=500&...
+  payload_json 에 actor_address, in/out symbol 까지 모두 포함.
+
+[데이터 무결성 보장]
+  GET /explorer/verify?from=1&to=N
+  → ok:true 면 hash chain 변조 없음을 직접 sha256 으로 재계산하여 확인.
+  머클루트는 GET /explorer/merkle/latest 로 학습 시점에 stamp 가능.
+
+[Numpy/Pandas 변환 팁]
+  - reserve_*, amount_* 는 raw 문자열로 옴 → int(x)/10**decimals 로 변환.
+  - bucket_start 는 ISO8601 → pd.to_datetime(utc=True).
+  - confidence 0~1 그대로 사용.
+
+================================================================================
+10. 프론트 /ai 페이지가 기대하는 스키마 (UI 와의 계약)
+================================================================================
+src/app/ai/page.tsx 가 다음을 기대합니다 (AiSignal/AiPrediction/AiSentiment):
+
+[/ai/signals]
+  side ∈ buy/sell/hold      → 색깔 뱃지 (초록/빨강/노랑)
+  confidence ∈ 0~1          → 0~100% 너비 진행 바
+  source ∈ "bot" 등          → "system" 으로 fallback 표시
+  reason 한국어 문장          → 그대로 표시
+
+[/ai/predictions]
+  horizon: 1h/24h/7d 가 동시에 있어야 그리드가 모두 채워짐.
+  predicted_price 는 사람단위 문자열로 그대로 출력.
+  confidence 는 X% 로 표시.
+
+[/ai/sentiment]
+  sentiment_score                → 그라디언트 바 위치 + 강세/약세/중립 라벨
+  rsi / macd / ma7_human / ma25_human → 보조 정보 라인
+
+UI 가 빈 상태일 때:
+  "AI 봇이 아직 신호를 올리지 않았어요. AI팀이 봇을 가동하면 여기에 표시돼요."
+  → 즉, 첫 ingest 한 번이면 바로 살아납니다.
+
+================================================================================
+11. 운영 체크리스트와 흔한 실수
+================================================================================
+[ ] 봇 raw 키를 환경변수/시크릿매니저로 분리. 코드/git에 평문 금지.
+[ ] decimals 변환 — predicted_price_human/ma_*_human 에는 사람단위 문자열만.
+[ ] confidence 는 0.0~1.0. 65 (퍼센트) 로 보내면 백엔드가 reject.
+[ ] sentiment_score 는 정수 -100~100.
+[ ] symbol 대소문자 — 백엔드는 그대로 저장. /market/coins 의 symbol 그대로 사용.
+[ ] horizon 은 정확히 "1h" / "24h" / "7d". 다른 값은 422.
+[ ] StaleQuote(409) 시 재견적. quote 의 expected_revision 이 핵심.
+[ ] CORS — 봇이 같은 머신/네트워크가 아니면 백엔드 CORS_ORIGINS 추가.
+[ ] 폭주 방지 — ingest 호출 빈도는 최소 30~60초 간격 권장. (서버 SQLite WAL)
+[ ] 무결성 — 학습용 데이터 dump 후 /explorer/verify 로 한번 검증 후 학습 시작.
+
+[자주 보는 에러]
+  401 UNAUTHORIZED  → X-Bot-Key 헤더 빠짐 또는 폐기된 키.
+  403 FORBIDDEN     → scope 부족 (bot:ingest 가 키에 없는 경우).
+  409 STALE_QUOTE   → quote 이후 풀이 변경됨. 재견적.
+  422 VALIDATION_ERROR → confidence/horizon/score 범위/타입 위반.
+  429 (현재 미구현)  → 추후 추가 가능, 지금은 무제한.
+
+================================================================================
+12. 빠른 시작 — 5분짜리 파이썬 봇 예시
+================================================================================
+다음 코드를 그대로 돌리면 BTC/ETH 신호를 5초마다 무작위로 올리는 미니봇이
+프론트 /ai 페이지에 즉시 나타납니다.
+
+  # pip install httpx
+  import httpx, random, time, os
+
+  BASE = os.environ.get("SWAPGO_BASE", "http://localhost:8000")
+  KEY  = os.environ["SWAPGO_BOT_KEY"]    # 콘솔에 한 번 나왔던 raw 키
+  H = {"X-Bot-Key": KEY, "Content-Type": "application/json"}
+
+  with httpx.Client(base_url=BASE, headers=H, timeout=10) as cli:
+      while True:
+          symbols = ["BTC", "ETH"]
+
+          # 1) 시그널
+          items = [{
+              "symbol": s,
+              "side": random.choice(["buy", "sell", "hold"]),
+              "confidence": round(random.uniform(0.4, 0.9), 2),
+              "reason": "데모 신호 (random)",
+              "expires_in_sec": 600,
+          } for s in symbols]
+          r = cli.post("/ai/ingest/signals", json={"items": items})
+          r.raise_for_status()
+
+          # 2) 예측
+          ticker = cli.get("/chart/ticker", params={"pool_id": 1}).json()
+          last = float(ticker["data"]["last_price"]) if ticker["ok"] else 43000
+          items = [{
+              "symbol": "BTC",
+              "horizon": h,
+              "predicted_price_human": f"{last * (1 + random.uniform(-0.02, 0.02)):.2f}",
+              "confidence": round(random.uniform(0.5, 0.85), 2),
+              "model_tag": "demo-rng",
+          } for h in ["1h", "24h", "7d"]]
+          cli.post("/ai/ingest/predictions", json={"items": items}).raise_for_status()
+
+          # 3) 심리
+          items = [{
+              "symbol": s,
+              "sentiment_score": random.randint(-60, 60),
+              "rsi": round(random.uniform(20, 80), 1),
+              "macd": round(random.uniform(-1, 1), 2),
+          } for s in symbols]
+          cli.post("/ai/ingest/sentiment", json={"items": items}).raise_for_status()
+
+          time.sleep(5)
+
+이 봇을 띄워두고 http://localhost:3000/ai 새로고침하면
+"실시간 AI 신호 / 가격 예측 / 시장 심리" 카드 3개가 모두 채워집니다.
+
+================================================================================
+13. swapgo-engine — 이 가이드의 참조 구현체
+================================================================================
+위 1~12장의 계약을 실제 코드로 구현한 AI 엔진/봇 서버입니다. 별도 FastAPI 앱으로
+포트 :9000 에서 돌며, SwapGo 백엔드(:8000)를 봇 키로 호출합니다.
+
+[폴더 구조]
+  swapgo-engine/
+  ├─ main.py            ← FastAPI 앱 + lifespan(봇 태스크 기동) + 상태 엔드포인트
+  ├─ config.py          ← Settings(.env 자동 로드) — 풀ID/모델경로/봇 토글/거래 파라미터
+  ├─ .env / .env.example
+  ├─ ai/                ← AIEngine (ONNX 추론 래퍼, 피처 버퍼/EMA)
+  ├─ bots/              ← 봇 태스크들 (아래 목록)
+  ├─ core/              ← swapgo_client.py(백엔드 REST 클라이언트, envelope 자동 unwrap)
+  ├─ services/          ← candle_cache, feature_builder, ingest_service, event_bus
+  ├─ models/            ← model_{scalper,swing,longterm,trade}.onnx + scaler_*.pkl
+  ├─ schemas/           ← 응답 모델
+  └─ train/             ← 오프라인 학습 스크립트
+
+[봇 목록 (bots/)]
+  bot_a_ingest.py  REST 폴링으로 캔들 받아 3모델 추론 → /ai/ingest/* 업로드 (bot:ingest)
+  bot_b_ws.py      WS(ohlc) 기반 ingest 봇 (use_websocket=true 일 때만)
+  bot_a_trade.py   model_trade.onnx 로 BTC·ETH 방향 판단 → /swap/execute (bot:trade).
+                   모델이 (btc_ret, eth_ret) 을 모두 내므로 두 풀 모두 거래(풀별 쿨다운).
+  bot_b_noise.py   매 사이클 BTC/ETH 풀을 무작위로 골라 매수/매도 → 양 풀에 거래량
+                   공급(가상 시장 조성) (bot:trade)
+  bot_c_lp.py      유동성 공급/회수 봇 (bot:lp, enable_lp_bot=true 일 때만)
+  ※ 두 거래봇 모두 base→quote(매도)는 코인 수량, quote→base(매수)는 USDT 수량을
+    사용하며 매수 시 현재가로 환산. 부팅 충전은 BTC·ETH·USDT 3종(거래하는 풀의
+    base/quote 가 모두 있어야 INSUFFICIENT_BALANCE 가 안 난다).
+
+[ONNX 모델 — ai/AIEngine]
+  Scalper  seq_len=10  (1h 신호)   Swing seq_len=60 (24h)
+  Longterm seq_len=120 (7d 신호)   Trade seq_len=30 (거래봇 전용)
+  공통 8피처 scaler + horizon 별 scaler. 버퍼가 seq_len 만큼 차야 추론 시작(warmup).
+
+[엔드포인트 (:9000)]
+  GET /health         봇 태스크 running/failed 상태
+  GET /status         캔들캐시·모델 통계·각 봇 trade_count/skip_count
+  GET /stream/trades  거래 발생 SSE 스트림(BotA_Trade/BotB_Noise 체결 이벤트)
+  GET /docs           Swagger
+
+[.env 주요 값]
+  SWAPGO_BOT_KEY=<raw 봇키>       ← 백엔드 콘솔에 1회 출력된 키(=DB의 default-bot)
+  SWAPGO_BASE_URL=http://127.0.0.1:8000
+  POOL_ID=1  ETH_POOL_ID=2
+  CANDLE_INTERVAL=5m  INGEST_INTERVAL_SEC=30
+  ENABLE_TRADE_BOTS=true          ← true 면 거래봇 가동 + 부팅 시 모의 자금 자동 충전
+  (config.py 기본값: trade_execute_amount_human=0.02(base/BTC 기준),
+   trade_execute_slippage_bps=200, noise_amount 0.001~0.05, use_websocket=false 등)
+
+[실행]
+  cd swapgo-engine
+  python -m venv .venv && .venv\Scripts\python.exe -m pip install -r requirements.txt
+  .venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 9000
+  (루트의 swapgo-launcher.pyw "전체 시작" 으로 백엔드→엔진→프론트 한 번에 기동)
+
+[순서/의존성]
+  1) 백엔드(:8000)가 먼저 떠 있어야 함(엔진이 부팅 시 인증 self-check + 캔들 prefetch).
+  2) 피처 빌드에 풀당 캔들이 충분해야 함(seq_len 만큼). 백엔드 reset_demo.py 가 시드.
+  3) Windows 콘솔(cp949)은 PYTHONIOENCODING=utf-8 필요 — 런처가 자동 주입함.
+
+================================================================================
+끝.  궁금한 점은 다음 위치를 보면 가장 빠릅니다:
+  [백엔드]
+  - app/api/v1/ai.py            (엔드포인트 시그니처)
+  - app/api/v1/swap.py, wallet.py (봇키 공용 거래/지갑 엔드포인트)
+  - app/schemas/ai.py           (요청/응답 Pydantic 모델)
+  - app/services/ai_ingest_service.py (저장/조회 로직 + decimals 변환)
+  - app/services/chart_service.py (캔들 집계 + 가격 스케일 보정)
+  - app/db/models/ai_*.py       (테이블 정의)
+  [엔진(참조 구현체)]
+  - swapgo-engine/main.py       (봇 태스크 기동 + 자금 자동 충전)
+  - swapgo-engine/bots/bot_a_trade.py, bot_b_noise.py (거래 봇)
+  - swapgo-engine/bots/bot_a_ingest.py (신호/예측/심리 업로드 봇)
+  - swapgo-engine/core/swapgo_client.py (백엔드 호출 클라이언트)
+  [프론트]
+  - swapgo-frontend/src/app/ai/page.tsx (UI 가 어떻게 그리는지)
+================================================================================
